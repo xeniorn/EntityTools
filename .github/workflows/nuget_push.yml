@@ -1,0 +1,62 @@
+# This workflow will build & test the .NET project, then package it and push to nuget
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
+
+name: nuget-deploy
+
+on:
+  push:
+    tags:
+    - "v[0-9]+.[0-9]+.[0-9]+"
+    - "v[0-9]+.[0-9]+.[0-9]+-[A-Za-z0-9]+"
+  workflow_dispatch:
+    inputs:
+      override_version:
+        description: 'should we override the version'
+        required: true
+        default: true
+        type: boolean
+      version:
+        description: 'version to build'
+        required: true
+        default: '0.0.0-test'
+        type: string
+
+env:
+  NUGET_OUTPUT_FOLDER: '.tmp'
+  PACK_PROJECT_PATH: './EntityTools/EntityTools.csproj'
+  PROJECT_NAME: 'EntityTools'
+  TARGET_CONFIGURATION: 'Release'
+  REQUIRED_DOTNET_VERSION: '9.x'
+    
+jobs:
+  build_and_deploy_nuget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.REQUIRED_DOTNET_VERSION }}
+    # - name: Verify commit exists in origin/develop or origin/main
+    #   run: |
+    #     git fetch --no-tags --prune --depth=1 origin +refs/heads/*:refs/remotes/origin/*
+    #     git branch --remote --contains | grep -e 'origin/(main|develop)'
+    - name: Set VERSION variable from tag
+      if: "${{ inputs.override_version == false || inputs.override_version == 'false' }}"
+      run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
+    - name: Override version
+      if: "${{ inputs.override_version == true || inputs.override_version == 'true' }}"
+      run: echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
+    - name: Build
+      run: dotnet build --configuration ${TARGET_CONFIGURATION} /p:Version=${VERSION}
+    - name: Test
+      run: dotnet test --configuration ${TARGET_CONFIGURATION} /p:Version=${VERSION} --no-build
+    - name: Pack
+      run: dotnet pack --configuration ${TARGET_CONFIGURATION} /p:PackageVersion=${VERSION} --no-build --output ${NUGET_OUTPUT_FOLDER} --force ${PACK_PROJECT_PATH} 
+    - name: Push
+      run: dotnet nuget push ${NUGET_OUTPUT_FOLDER}/${PROJECT_NAME}.${VERSION}.nupkg --source ${NUGET_ENDPOINT_URL} --api-key ${{ secrets.NUGET_API_KEY }}
+      env:
+        NUGET_ENDPOINT_URL: https://api.nuget.org/v3/index.json
+        NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
