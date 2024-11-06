@@ -1,10 +1,12 @@
-![Status](https://github.com/xeniorn/EntityHelper/actions/workflows/dotnet.yml/badge.svg?branch=develop)
+![Status](https://github.com/xeniorn/EntityTools/actions/workflows/dotnet.yml/badge.svg?branch=develop)
+![NuGet Version](https://img.shields.io/nuget/v/EntityTools)
+
 
 Helps handling Entities, in particular matching by value instead of by ref/id.
 
 With a class like:
 
-'''C#
+```cs
 public abstract class EntityBase
 {
     [Key]
@@ -20,14 +22,16 @@ public class SimpleValueEntity : EntityBase
     [UsedInEntityByValueComparison]
     public long Value { get; private set; }
 }
-'''
+```
 
 Can do stuff like:
 
-'''C#
+```cs
 DbContext myDb = GetDb();
+IEnumerable<SimpleValueEntity> input = GetDummySearchEntitiesWithValues([1, 5, 23]);
+
 var (existing, missing) = await EntityHelper.GetExistingAndMissingEntitiesByValue(
     db: myDb,
     targets: input,
     maxComparisonsPerBatch: int.MaxValue);
-'''
+```
