@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Reflection;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace EntityTools;
 
@@ -157,9 +158,11 @@ public static class EntityHelper
 
         var navigationComparisonProps = comparisonProps.Where(x => PropertyIsNavigation<T>(db, x)).ToList();
 
+        var navWithIds = navigationComparisonProps.Select(x => (NavProperty: x, IdProperty: GetIdPropertyOfNavigationTarget<T>(db, x))).ToList();
+
         var source = db.Set<T>().AsQueryable();
 
-        return GetExistingAndMissingEntitiesByValue(source, targets, navigationComparisonProps, maxComparisonsPerBatch, token);
+        return GetExistingAndMissingEntitiesByValue(source, targets, navWithIds, maxComparisonsPerBatch, token);
     }
 
     /// <summary>
@@ -169,6 +172,7 @@ public static class EntityHelper
     /// <typeparam name="T">Type of the entity being tested</typeparam>
     /// <param name="source">Source being searched. Typically a DbSet. Designed for a postgres-based DbContext</param>
     /// <param name="items">Entities existence of which is being tested. Result will contain this set split into two groups (existing, missing)</param>
+    /// <param name="navsWithIds">Nav properties have to be treated differently and therefore need to be specified</param>
     /// <param name="maxComparisonsPerQuery">Force the query to run in batches no larger than the provided parameter. Set to null to automatically select batch size.</param>
     /// <param name="token"></param>
     /// <returns>List of targets that exist in the source and a list of targets that are missing in the source.</returns>
@@ -178,7 +182,7 @@ public static class EntityHelper
     public static async Task<(IReadOnlyCollection<T> Existing, IReadOnlyCollection<T> Missing)> GetExistingAndMissingEntitiesByValue<T>(
         IQueryable<T> source,
         IEnumerable<T> items,
-        IEnumerable<PropertyInfo>? mustIncludeProperties = null,
+        IEnumerable<(PropertyInfo NavProperty, PropertyInfo IdProperty)>? navsWithIds = null,
         int maxComparisonsPerQuery = 10_000,
         CancellationToken token = default)
         where T : class
@@ -189,7 +193,7 @@ public static class EntityHelper
 
         // I have to .Include all the Navigations for Value properties from the database
         var sourceWithIncludes = source;
-        foreach (var prop in mustIncludeProperties ?? [])
+        foreach (var prop in navsWithIds?.Distinct().Select(x=>x.NavProperty) ?? [])
         {
             sourceWithIncludes = ApplyInclude(sourceWithIncludes, prop);
         }
@@ -202,6 +206,7 @@ public static class EntityHelper
         await foreach (var (filterExpression, batch) in GetExpressionFor_MatchAnyOfItemsByValue_Async(
                            uniqueSearchItems,
                            equalityProperties,
+                           navsWithIds ?? [],
                            maxComparisonsPerQuery)
                            .WithCancellation(token))
         {
@@ -211,7 +216,7 @@ public static class EntityHelper
 
             // Normally it would be a problem to compare a navigation property, but here it would have already failed in the first query, i.e. we don't need to check again
             // this is done in-memory, no need for batching and stuff (anyhow we are working on a batch already)
-            var filterMatchedExpression = GetExpressionFor_MatchAnyOfItemsByValue(existing, equalityProperties);
+            var filterMatchedExpression = GetExpressionFor_MatchAnyOfItemsByValue(existing, equalityProperties, navsWithIds ?? []);
 
             var filterNotMatchedExpression = InvertBooleanExpression(filterMatchedExpression);
             // for normal LINQ to Enumerable
@@ -335,11 +340,13 @@ public static class EntityHelper
         GetExpressionFor_MatchAnyOfItemsByValue<T>(
             IEnumerable<T> equalityComparisonItems,
             IEnumerable<PropertyInfo> equalityProperties,
+            IEnumerable<(PropertyInfo NavProperty, PropertyInfo IdProperty)> navsWithIds,
             int maxComparisonsPerBatch)
         where T : class =>
         GetExpressionFor_MatchAnyOfItemsByValue_Async(
             equalityComparisonItems,
             equalityProperties,
+            navsWithIds,
             maxComparisonsPerBatch)
             .ToBlockingEnumerable();
 
@@ -353,10 +360,12 @@ public static class EntityHelper
     private static Expression<Func<T, bool>>
         GetExpressionFor_MatchAnyOfItemsByValue<T>(
             IEnumerable<T> equalityComparisonItems,
-            IEnumerable<PropertyInfo> equalityProperties) where T : class
+            IEnumerable<PropertyInfo> equalityProperties,
+            IEnumerable<(PropertyInfo NavProperty, PropertyInfo IdProperty)> navsWithIds) where T : class
         => GetExpressionFor_MatchAnyOfItemsByValue(
                 equalityComparisonItems,
                 equalityProperties,
+                navsWithIds,
                 Int32.MaxValue)
             .Single().ExpressionForBatch;
 
@@ -374,11 +383,11 @@ public static class EntityHelper
         GetExpressionFor_MatchAnyOfItemsByValue_Async<T>(
             IEnumerable<T> equalityComparisonItems,
             IEnumerable<PropertyInfo> equalityProperties,
+            IEnumerable<(PropertyInfo NavProperty, PropertyInfo IdProperty)> navsWithIds,
             int maxComparisonsPerBatch)
         where T : class
     {
         var itemsToPlowThrough = equalityComparisonItems.Distinct().ToList();
-        var propertiesToUse = equalityProperties.Distinct().ToList();
 
         if (itemsToPlowThrough.Count == 0)
         {
@@ -389,8 +398,7 @@ public static class EntityHelper
         while (true)
         {
             var (batchExpression, batchItems) =
-                GetPartialExpressionFor_MatchAnyOfItemsByValue(itemsToPlowThrough, propertiesToUse,
-                    maxComparisonsPerBatch);
+                GetPartialExpressionFor_MatchAnyOfItemsByValue(itemsToPlowThrough, equalityProperties, navsWithIds, maxComparisonsPerBatch);
 
             if (batchItems.Count == 0)
                 throw new ArgumentException($"Unable to get expression for batch equality of {nameof(T)} items," +
@@ -415,6 +423,8 @@ public static class EntityHelper
     }
     /// <summary>
     /// Get a batch without knowing the batch size in advance (need to be flexible due to variable number of child elements in collection entities.
+    ///
+    /// Supports nav properties, but only to entities with an identifier that's a single property (no composite keys) that has to be provided on input.
     /// </summary>
     /// <typeparam name="T"></typeparam>
     /// <param name="equalityComparisonItems"></param>
@@ -425,11 +435,18 @@ public static class EntityHelper
     private static (Expression<Func<T, bool>> Expression, IReadOnlyCollection<T> UsedInputItems) GetPartialExpressionFor_MatchAnyOfItemsByValue<T>(
         IEnumerable<T> equalityComparisonItems,
         IEnumerable<PropertyInfo> equalityProperties,
+        IEnumerable<(PropertyInfo NavProperty, PropertyInfo IdProperty)> navsWithIds,
         int maxComparisons)
         where T : class
     {
         var itemsToUseForComparison = equalityComparisonItems.Distinct().ToList();
         var propertiesToUseForComparison = equalityProperties.Distinct().ToList();
+        var navPropertyMap = navsWithIds
+            .Distinct()
+            .ToDictionary(
+                x => x.NavProperty, 
+                x => x.IdProperty
+                );
 
         if (!itemsToUseForComparison.Any())
         {
@@ -438,17 +455,27 @@ public static class EntityHelper
             return ((x) => false, itemsToUseForComparison.ToList());
         }
 
-        var collectionProperties = propertiesToUseForComparison
-            .Where(x => true
-                           && x.PropertyType.IsGenericType
-                           && typeof(ICollection<>)
-                               .IsAssignableFrom(x.PropertyType
-                                   .GetGenericTypeDefinition()
-                                   .MakeGenericType(x.PropertyType.GetGenericArguments()))
-            ).ToList();
+        var collectionProperties = new List<PropertyInfo>();
+        foreach (var pi in propertiesToUseForComparison)
+        {
+            var isGeneric = pi.PropertyType.IsGenericType;
+            if (!isGeneric) continue;
+
+            var isICollection = pi.PropertyType.GetGenericTypeDefinition() == typeof( ICollection<>);
+            if (!isICollection) continue;
+
+            var genericArgs = pi.PropertyType.GetGenericArguments();
+            var argIsOk = genericArgs.Length == 1 && genericArgs.Single().IsClass;
+
+            if (!argIsOk) throw new ArgumentException($"Something wrong with the type of property {pi}, generic args not matching expectations");
+            collectionProperties.Add(pi);
+        }
+        
+        // TODO: check all edge cases...
+        var simpleNavProperties = navPropertyMap.Keys.Except(collectionProperties).ToList();
 
         // TODO: not everything that's not an ICollection is simple...
-        var simpleProperties = propertiesToUseForComparison.Except(collectionProperties).ToList();
+        var simpleProperties = propertiesToUseForComparison.Except(collectionProperties).Except(simpleNavProperties).ToList();
 
         Dictionary<PropertyInfo, Type> collectionInnerItemTypeMap = new();
         foreach (var propertyInfo in collectionProperties)
@@ -474,60 +501,89 @@ public static class EntityHelper
         foreach (var item in itemsToUseForComparison)
         {
             // Create an "AND" expression for comparing all properties of this item
+            // true && item.MyCollection.Count == x && item.MyCollection.Contains(...)
             Expression itemPredicate = Expression.Constant(true);
 
             foreach (var property in collectionProperties)
             {
                 var itemTypeInsideCollection = collectionInnerItemTypeMap[property];
 
+                // property to get the id from the nav entity
+                var idProperty = navPropertyMap[property];
+                var idTypeInsideCollection = idProperty.PropertyType;
+                
                 var itemValuesCollection = (ICollection)property.GetValue(item);
                 var count = itemValuesCollection.Count;
 
-                // + 1 is for the "count" comparison
+                // + N for each item and + 1 for the "count" comparison itself
                 if (totalCount + count + 1 > maxComparisons)
                 {
                     cannotFitMoreItems = true;
                     break;
                 }
                 totalCount += count;
-
-                // Build the property expression for the database query (e.g., x.Property)
-                var propertyExpression = Expression.Property(parameter, property);
+                
+                // Build the property expression for the query (e.g., entity.MyItems)
+                var collectionPropertyExpression = Expression.Property(parameter, property);
 
                 // confirm first the number of items is the same
                 var countProperty = property.PropertyType.GetProperty(
                     "Count",
                     BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                
+                {
+                    if (countProperty is null)
+                        throw new InvalidOperationException("Target collection property must have a Count property");
+                }
 
-                if (countProperty is null)
-                    throw new InvalidOperationException("Target collection property must have a Count property");
-
-                // Build the property expression for the count (e.g. x.MyValues.Count)
-                var countPropertyExpression = Expression.Property(propertyExpression, countProperty);
-
-                // e.g. (5)
-                var expectedCountExpression = Expression.Constant(count);
-
-                // build equality, e.g. entity.Property.Count == 5
-                var countEqualityExpression = Expression.Equal(countPropertyExpression, expectedCountExpression);
+                // build equality, e.g. entity.MyItems.Count == 5
+                var countEqualityExpression = Expression.Equal
+                (
+                    // entity.MyItems.Count
+                    Expression.Property(collectionPropertyExpression, countProperty),
+                    // 5
+                    Expression.Constant(count)
+                );
 
                 // combine with prior equality expression
+                // (...) && entity.MyItems.Count == 5
                 itemPredicate = Expression.AndAlso(itemPredicate, countEqualityExpression);
 
                 //  now check whether all of the tested items are contained in the collection
-                // entity.MyCollectionProperty.All(element => testCOllection.Contains(element))
+                // entity.MyCollectionProperty.All(element => testCollection.Contains(element))
                 {
+                    //TODO: hot paths for when item type is int or long, so I don't have to use object
+
+                    // Get the value of the property from the item
+                    var itemIds = new List<object>();
+                    foreach (var valueInCollection in itemValuesCollection)
+                    {
+                        itemIds.Add(idProperty.GetValue(valueInCollection));
+                    }
+
+                    // [...ids...]
+                    var itemIdsExpression = Expression.Constant(itemIds);
+
                     const string subParameterSymbol = "element";
+                    // element, which will be used in: element => ...
                     var subParameterExpression = Expression.Parameter(itemTypeInsideCollection, subParameterSymbol);
+                    
+                    // element.Id
+                    var innerIdExpression = Expression.Property(subParameterExpression, idProperty);
+                    // (object)element.Id
+                    var innerIdAsObjectExpression = Expression.Convert(innerIdExpression, typeof(object));
 
-                    var testSetExpression = Expression.Constant(property.GetValue(item));
+                    var containsMethod = typeof(ICollection<>).MakeGenericType(typeof(object))
+                        .GetMethod("Contains", new[] { typeof(object) });
 
-                    var containsMethod = typeof(ICollection<>).MakeGenericType(itemTypeInsideCollection)
-                        .GetMethod("Contains", new[] { itemTypeInsideCollection });
+                    //var containsMethod = typeof(ICollection<>).MakeGenericType(idTypeInsideCollection)
+                    //    .GetMethod("Contains", new[] { idTypeInsideCollection });
+                    
+                    // [myIds].Contains(element.Id)
                     var containsCallExpression =
-                        Expression.Call(testSetExpression, containsMethod, subParameterExpression);
+                        Expression.Call(itemIdsExpression, containsMethod, innerIdAsObjectExpression);
 
-                    // element => [myCollection].Contains(element)
+                    // element => [myIds].Contains(element.Id)
                     var containsLambdaExpression = Expression.Lambda(containsCallExpression, subParameterExpression);
 
                     var allMethod = typeof(Enumerable)
@@ -535,18 +591,63 @@ public static class EntityHelper
                         .First(m => m.Name == nameof(Enumerable.All) && m.GetParameters().Length == 2)
                         .MakeGenericMethod(itemTypeInsideCollection);
 
-                    // Construct the "x.Prop.All(e => input.Contains(e))" expression
-                    var allCallExpression = Expression.Call(allMethod, propertyExpression, containsLambdaExpression);
+                    // Construct the "entity.NavCollection.All(element => [myIds].Contains(element.Id))" expression
+                    var allCallExpression = Expression.Call(allMethod, collectionPropertyExpression, containsLambdaExpression);
 
-                    //// Create the final lambda expression: x => x.Prop.All(e => input.Contains(e))
-                    //var containsAllLambdaExpression = Expression.Lambda(allCallExpression, parameter);
-
-                    //var containsAllCall = Expression.Call(propertyExpression, containsAllLambdaExpression);
-
+                    // (...) AndAlso entity.NavCollection.All(element => [myIds].Contains(element.Id))
                     itemPredicate = Expression.AndAlso(itemPredicate, allCallExpression);
                 }
             }
 
+            // for nav properties, do entity.Property.Id == item.Property.Id
+            // actual relational DB handlers will translate entity.Property == item.Property to the correct expression automatically,
+            // but LINQ-to-Enumerable will not, and will use .Equals instead, leading likely to ReferenceEquals, which is unsuitable
+            foreach (var property in simpleNavProperties)
+            {
+                if (totalCount + 1 > maxComparisons)
+                {
+                    cannotFitMoreItems = true;
+                    break;
+                }
+                totalCount++;
+
+                // property to get the id from the nav entity
+                var idProperty = navPropertyMap[property];
+
+                // Get the value of the property from the item
+                var idValue = Expression.Constant(idProperty.GetValue(property.GetValue(item)), idProperty.PropertyType);
+
+                // Build the property expression for the database query (e.g., x.Property)
+                var propertyExpression = Expression.Property(parameter, property);
+                // x.Property.Id
+                var propertyIdExpression = Expression.Property(propertyExpression, idProperty);
+
+                // don't use operator since this is not overloaded everywhere, use Equals expression
+                // ... actually, do use operator, because it goes to IQueryable
+                Expression equalityExpression;
+                var useOperatorForEquality = true;
+                if (useOperatorForEquality)
+                {
+                    // Build the equality expression (e.g., x.Property == item.Property)
+                    equalityExpression = Expression.Equal(propertyIdExpression, idValue);
+                }
+                else // use Equals method
+                {
+                    var equalsMethod = type.GetMethod(
+                        "Equals",
+                        BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy,
+                        null,
+                        new[] { property.PropertyType },
+                        null);
+
+                    equalityExpression = Expression.Call(propertyExpression, equalsMethod, idValue);
+                }
+
+                // Combine the equality expression with the itemPredicate using "AND"
+                itemPredicate = Expression.AndAlso(itemPredicate, equalityExpression);
+            }
+
+            // each simple property is just entity.Property == item.Property
             foreach (var property in simpleProperties)
             {
                 if (totalCount + 1 > maxComparisons)
@@ -671,8 +772,71 @@ public static class EntityHelper
         var entTypeInModel = db.Model.FindEntityType(entityType)!;
 
         // TODO: do I need to check SkipNavigation properties for M2M?
-        var nav = entTypeInModel.FindNavigation(propertyInfo);
-        var isNavigation = nav is not null;
+        var directNav = entTypeInModel.FindNavigation(propertyInfo);
+        var skipNav = entTypeInModel.FindSkipNavigation(propertyInfo);
+        var isNavigation = directNav is not null || skipNav is not null;
         return isNavigation;
     }
+
+    /// <summary>
+    /// For the given input type T and navigational property, finds the PropertyInfo for the entity mapped by that navigation property.
+    /// Maps via PrimaryKey, which must map to a single property.
+    /// 
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    /// <param name="db"></param>
+    /// <param name="propertyInfo"></param>
+    /// <returns></returns>
+    /// <exception cref="ArgumentException"></exception>
+    /// <exception cref="NotSupportedException"></exception>
+    private static PropertyInfo GetIdPropertyOfNavigationTarget<T>(DbContext db, PropertyInfo propertyInfo)
+        where T : class
+    {
+        var entityType = typeof(T);
+
+        if (!PropertyIsNavigation<T>(db, propertyInfo))
+            throw new ArgumentException($"The provided property info ({propertyInfo.DeclaringType?.Name}:{propertyInfo.Name}) must link to a navigational property of provided type ({entityType})");
+
+        var propType = propertyInfo.PropertyType;
+        
+        var isCollection = propType.IsGenericType 
+                           && (false 
+                               || propType.GetGenericTypeDefinition() == typeof(ICollection<>)
+                               || propType.GetGenericTypeDefinition() == typeof(IEnumerable<>));
+
+        Type GetSingleGenericArgument(Type type)
+        {
+            var args = type.GetGenericArguments();
+            if (args.Length == 1) return args.Single();
+            throw new ArgumentException(
+                $"Provided type {type} has multiple generic arguments, but only one is allowed");
+        } 
+
+        var navEntityClrType = isCollection
+            ? GetSingleGenericArgument(propType) 
+            : propType;
+
+        var navEntityType = db.Model.FindEntityType(navEntityClrType)!;
+
+        var primaryKeyForNavType = navEntityType.FindPrimaryKey();
+
+        if (primaryKeyForNavType == null)
+            throw new ArgumentException(
+                $"Navigation target is of type {navEntityType.ClrType} but does not have a primary key");
+
+        if (primaryKeyForNavType!.Properties.Count != 1)
+            throw new NotSupportedException(
+                $"Navigation target is of type {navEntityType.ClrType} and has a composite primary key. Only single-property keys are supported.");
+
+        var keyProperty = primaryKeyForNavType.Properties.Single();
+
+        var res = keyProperty.PropertyInfo;
+
+        if (res is null)
+            throw new NotSupportedException(
+                $"Navigation target is of type {navEntityType.ClrType} and has a key {keyProperty.Name}, but it does not seems to be attached to a Clr Property. Shadow/implicit keys are not supported.");
+
+        return res!;
+    }
+
 }
