@@ -20,7 +20,7 @@ public abstract class PostgresBasedTest<TDatabase> : IAsyncLifetime where TDatab
 
     private TDatabase CreateNewDbContext(DbContextOptions<TDatabase> options)
     {
-        return (TDatabase)(Activator.CreateInstance(typeof(TDatabase), [_options]) ?? throw new NullReferenceException());
+        return (TDatabase)(Activator.CreateInstance(typeof(TDatabase), [options]) ?? throw new NullReferenceException());
     }
 
 
