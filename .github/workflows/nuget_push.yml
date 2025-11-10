@@ -32,7 +32,19 @@ jobs:
   build_and_deploy_nuget:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    permissions:
+      id-token: write  # enable GitHub OIDC token issuance for this job
+    
     steps:
+
+    # Get a short-lived NuGet API key
+    - name: NuGet login (OIDC → temp API key)
+      uses: NuGet/login@v1
+      id: login
+      with:
+        user: ${{ secrets.NUGET_USER }}
+    
     - name: Checkout
       uses: actions/checkout@v4
     - name: Setup .NET
@@ -56,7 +68,7 @@ jobs:
     - name: Pack
       run: dotnet pack --configuration ${TARGET_CONFIGURATION} /p:PackageVersion=${VERSION} --no-build --output ${NUGET_OUTPUT_FOLDER} --force ${PACK_PROJECT_PATH} 
     - name: Push
-      run: dotnet nuget push ${NUGET_OUTPUT_FOLDER}/${PROJECT_NAME}.${VERSION}.nupkg --source ${NUGET_ENDPOINT_URL} --api-key ${{ secrets.NUGET_API_KEY }}
+      run: dotnet nuget push ${NUGET_OUTPUT_FOLDER}/${PROJECT_NAME}.${VERSION}.nupkg --source ${NUGET_ENDPOINT_URL} --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
       env:
         NUGET_ENDPOINT_URL: https://api.nuget.org/v3/index.json
-        NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
